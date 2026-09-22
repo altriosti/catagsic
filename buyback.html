@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>CatASIC buyback tool</title>
+<link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+<style>
+:root{--chrome:#c7c9cf;--hi:#fff;--lo:#6b6e76;--shadow:#22232a;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px)}
+*,*::before,*::after{box-sizing:inherit}
+body{margin:0;min-height:100vh;background:radial-gradient(120% 90% at 50% 10%,#0d3b63,#06243f 70%);font:13px/1.4 Tahoma,Verdana,"Segoe UI",sans-serif;display:grid;place-items:center;padding:16px}
+.win{background:var(--chrome);padding:3px;width:min(520px,100%);box-shadow:inset -1px -1px 0 var(--shadow),inset 1px 1px 0 var(--hi),inset -2px -2px 0 var(--lo),8px 12px 30px rgba(0,0,0,.45)}
+.bar{background:linear-gradient(90deg,#0a246a,#3a6ea5);color:#fff;font-weight:700;padding:4px 8px}
+.body{padding:10px;display:flex;flex-direction:column;gap:8px}
+label{font-size:12px;color:#333}
+input{width:100%;padding:6px;font:20px "VT323",monospace;border:0;box-shadow:inset 1px 1px 0 var(--lo),inset -1px -1px 0 var(--hi),inset 2px 2px 0 var(--shadow);background:#fff}
+.btn{background:var(--chrome);border:0;padding:8px 14px;cursor:pointer;box-shadow:inset -1px -1px 0 var(--shadow),inset 1px 1px 0 var(--hi),inset -2px -2px 0 var(--lo)}
+.btn:active{box-shadow:inset 1px 1px 0 var(--shadow),inset -1px -1px 0 var(--hi)}
+.btn:focus-visible,input:focus-visible{outline:2px dotted #000;outline-offset:2px}
+.row{display:flex;gap:6px;flex-wrap:wrap}
+.term{background:#0b0b0f;color:#d6d6d6;font:18px/1.2 "VT323",monospace;padding:8px;height:170px;overflow:auto}
+.g{color:#36e27f}.r{color:#ff5d6c}
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="bar">BUYBACK.EXE</div>
+  <div class="body">
+    <p style="margin:0">Spends ETH from the buyback contract to buy CTASIC on Uniswap and burn it. Only the buyback owner or a keeper can run it.</p>
+    <div class="term" id="log"></div>
+    <div class="row"><button class="btn" id="connect">Connect wallet</button><button class="btn" id="status">Check queue</button></div>
+    <label for="amt">ETH to spend</label><input id="amt" value="0.05" inputmode="decimal">
+    <label for="min">Minimum CTASIC to receive (filled by Get quote)</label><input id="min" inputmode="decimal">
+    <div class="row"><button class="btn" id="quote">Get quote</button><button class="btn" id="run"><b>Buy and burn</b></button></div>
+  </div>
+</div>
+<script src="vendor/ethers.umd.min.js"></script>
+<script src="config.js"></script>
+<script>
+(() => {
+  const E = ethers, cfg = window.CATASIC_CONFIG, $ = (id) => document.getElementById(id);
+  const QUOTER = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"; // Uniswap QuoterV2 on Base
+  const WETH = "0x4200000000000000000000000000000000000006";
+  const FEE = 10000; // 1% pool
+  const rp = new E.JsonRpcProvider(cfg.rpc, cfg.chainId, { staticNetwork: true });
+  const BB_ABI = ["function buyAndBurn(uint256,uint256)", "function totalBurned() view returns (uint256)", "function totalEthSpent() view returns (uint256)", "function maxPerCall() view returns (uint256)"];
+  let signer;
+  const log = (m, c) => { const d = document.createElement("div"); if (c) d.className = c; d.textContent = "> " + m; $("log").appendChild(d); $("log").scrollTop = 1e9; };
+  if (!cfg.buyback || !E.isAddress(cfg.buyback)) log("Set the buyback address in config.js first.", "r");
+  async function connect() {
+    if (!window.ethereum) { log("No wallet found.", "r"); return; }
+    await window.ethereum.request({ method: "eth_requestAccounts" });
+    try { await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x" + cfg.chainId.toString(16) }] }); } catch (e) { log(e.message, "r"); }
+    signer = await new E.BrowserProvider(window.ethereum).getSigner();
+    log("Connected " + (await signer.getAddress()), "g");
+  }
+  $("connect").onclick = () => connect().catch((e) => log(e.shortMessage || e.message, "r"));
+  $("status").onclick = async () => {
+    try {
+      const bb = new E.Contract(cfg.buyback, BB_ABI, rp);
+      const [bal, burned, spent, max] = await Promise.all([rp.getBalance(cfg.buyback), bb.totalBurned(), bb.totalEthSpent(), bb.maxPerCall()]);
+      log(`Queue ${E.formatEther(bal)} ETH | spent ${E.formatEther(spent)} ETH | burned ${Number(E.formatEther(burned)).toLocaleString()} CTASIC | max per run ${E.formatEther(max)} ETH`);
+    } catch (e) { log(e.shortMessage || e.message, "r"); }
+  };
+  $("quote").onclick = async () => {
+    try {
+      const q = new E.Contract(QUOTER, ["function quoteExactInputSingle((address,address,uint256,uint24,uint160)) returns (uint256,uint160,uint32,uint256)"], rp);
+      const amt = E.parseEther($("amt").value.trim());
+      const [out] = await q.quoteExactInputSingle.staticCall([WETH, cfg.token, amt, FEE, 0]);
+      const min = (out * 95n) / 100n;
+      $("min").value = E.formatEther(min);
+      log(`Quote: ${Number(E.formatEther(out)).toLocaleString()} CTASIC. Minimum set 5% lower.`, "g");
+    } catch (e) { log("Quote failed: " + (e.shortMessage || e.message), "r"); }
+  };
+  $("run").onclick = async () => {
+    try {
+      if (!signer) await connect();
+      if (!$("min").value.trim()) { log("Press Get quote first.", "r"); return; }
+      const bb = new E.Contract(cfg.buyback, BB_ABI, signer);
+      const tx = await bb.buyAndBurn(E.parseEther($("amt").value.trim()), E.parseEther($("min").value.trim()));
+      log("Sent " + tx.hash.slice(0, 18) + "…");
+      await tx.wait();
+      log("Bought and burned.", "g");
+      $("min").value = "";
+    } catch (e) { log("Buyback failed: " + (e.shortMessage || e.message), "r"); }
+  };
+})();
+</script>
+</body>
+</html>
